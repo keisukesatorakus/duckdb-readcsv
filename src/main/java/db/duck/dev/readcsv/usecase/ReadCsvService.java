@@ -1,42 +1,32 @@
 package db.duck.dev.readcsv.usecase;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
-import org.jooq.DSLContext;
-import org.jooq.DataType;
-import org.jooq.Field;
-import org.jooq.impl.DSL;
-import org.jooq.impl.SQLDataType;
-import org.springframework.stereotype.Service;
+import javax.sql.DataSource;
 
+import org.jooq.impl.DSL;
+import org.springframework.jdbc.datasource.DataSourceUtils;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import db.duck.dev.readcsv.domain.CsvImportFormat;
 import db.duck.dev.readcsv.domain.Header;
+import db.duck.dev.readcsv.domain.ImportField;
+import db.duck.dev.readcsv.domain.ImportFieldType;
+import db.duck.dev.readcsv.domain.ImportMethod;
 import lombok.AllArgsConstructor;
 
 @Service
 @AllArgsConstructor
 public class ReadCsvService {
 
-  private final DSLContext dsl;
-
-  private static final Map<String, DataType<?>> TYPE_MAPPING = Map.ofEntries(
-      Map.entry("INTEGER", SQLDataType.INTEGER),
-      Map.entry("BIGINT", SQLDataType.BIGINT),
-      Map.entry("DOUBLE", SQLDataType.DOUBLE),
-      Map.entry("DOUBLE PRECISION", SQLDataType.DOUBLE),
-      Map.entry("FLOAT", SQLDataType.REAL),
-      Map.entry("BOOLEAN", SQLDataType.BOOLEAN),
-      Map.entry("DATE", SQLDataType.DATE),
-      Map.entry("TIMESTAMP", SQLDataType.TIMESTAMP),
-      Map.entry("VARCHAR", SQLDataType.VARCHAR),
-      Map.entry("TEXT", SQLDataType.VARCHAR)
-  );
-
-  private static DataType<?> mapToDataType(String type) {
-    // name から DataType に直で変換できないか
-    return TYPE_MAPPING.getOrDefault(type.toUpperCase(), SQLDataType.VARCHAR);
-  }
+  //  private final DSLContext dsl;
+  private final DataSource dataSource;
 
   public record Data(
       List<Header> headers,
@@ -45,43 +35,114 @@ public class ReadCsvService {
 
   }
 
+  @Transactional
   public Data read(String s3Url, boolean header, int skip) {
-    // 生の SQL で取得するしかないか
+
+    // format
+    var format = new CsvImportFormat(
+        1, "",
+        Map.of(
+            ImportField.CUST_CD, new ImportMethod.FromCsvColumn(4),
+            ImportField.AMOUNT, new ImportMethod.FromCsvColumn(6),
+            ImportField.DATE, new ImportMethod.FromCsvColumn(5)
+        )
+    );
+
+    var con = DataSourceUtils.getConnection(dataSource);
+    var dsl = DSL.using(con);
+
+    // 1. 対象S3 CSVのカラム一覧を取得
     var pragmaResult = dsl.fetch(String.format("DESCRIBE SELECT * FROM read_csv_auto('%s')", s3Url));
-
     List<String> columnNames = pragmaResult.getValues("column_name", String.class);
-    List<String> columnTypes = pragmaResult.getValues("column_type", String.class);
 
-    List<Header> headers = IntStream.range(0, columnNames.size())
-        .mapToObj(i -> new Header(columnNames.get(i), columnTypes.get(i)))
-        .toList();
+    // <order, カラム> formatで設定されているカラムを取得
+    var selectedColumns = format.getMappings().entrySet().stream()
+        .filter(entry -> entry.getValue() instanceof ImportMethod.FromCsvColumn)
+        .collect(Collectors.toMap(
+            entry -> ((ImportMethod.FromCsvColumn) entry.getValue()).columnIndex(),
+            Map.Entry::getKey
+        ));
 
-    // もうちょっとスマートな Field 生成方法があるかもしれない
-    var fields = IntStream.range(0, columnNames.size())
-        .mapToObj(i -> DSL.field('"' + columnNames.get(i) + '"', mapToDataType(columnTypes.get(i))))
-        .toList();
+    // <カラム名, 型名> CSVヘッダ一覧
+    var columns = IntStream.range(0, columnNames.size())
+        .boxed()
+        .collect(Collectors.toMap(
+            columnNames::get,
+            i -> Optional.ofNullable(selectedColumns.get(i)).map(ImportField::getType).orElse(ImportFieldType.VARCHAR),
+            (v1, v2) -> v1,
+            LinkedHashMap::new
+        ));
 
-    // memo: fields が列順序を保持しているので、取込設定の列順序から取得カラムを指定すればいい
+    // read_csv_auto のカラム設定
+    String columnsScan = columns.entrySet().stream()
+        .map(entry -> String.format("'%s': '%s'", entry.getKey(), entry.getValue()))
+        .collect(Collectors.joining(", "));
 
-    var res = dsl.select(fields)
-        .from(String.format("""
-              read_csv(
-                '%s'
-              )
-            """, s3Url
-//            , header, skip
-        ))
+    var count = dsl.fetch(
+        String.format(
+            """
+                  SELECT
+                    count(*)
+                  FROM
+                  read_csv_auto(
+                    '%s'
+                  )
+                """,
+            s3Url
+        )
+    );
+
+    var res = dsl.fetch(
+        String.format(
+            """
+                  SELECT
+                    *
+                  FROM
+                  read_csv_auto(
+                    '%s',
+                    columns = {{ %s }},
+                    store_rejects = true,
+                    rejects_scan = 'reject_scans',
+                    rejects_table = 'reject_errors',
+                    rejects_limit = 1000
+                  )
+                """,
+            s3Url,
+            columnsScan
+        )
+    );
+
+    // エラー情報の取得
+    var rejectErrors = dsl.select()
+        .from("reject_errors")
         .fetch();
+    printResult(rejectErrors);
+    var rejectScans = dsl.select()
+        .from("reject_scans")
+        .fetch();
+    printResult(rejectScans);
 
-    var rows = res.stream().map(record -> {
-      String[] row = new String[fields.size()];
-      for (int i = 0; i < fields.size(); i++) {
-        var value = record.get(fields.get(i));
-        row[i] = value != null ? value.toString() : null;
+    return new Data(
+        columnNames.stream().map(f -> new Header(f, f)).toList(),
+        res.stream().map(record -> {
+          String[] row = new String[columnNames.size()];
+          for (int i = 0; i < columnNames.size(); i++) {
+            var value = record.get(columnNames.get(i));
+            row[i] = value != null ? value.toString() : null;
+          }
+          return row;
+        }).toList()
+    );
+  }
+
+  private void printResult(org.jooq.Result<?> result) {
+    for (var record : result) {
+      for (var field : result.fields()) {
+        var columnName = field.getName();
+        var value = record.get(field);
+        System.out.printf("%s = %s%n", columnName, value);
       }
-      return row;
-    }).toList();
-
-    return new Data(headers, rows);
+      System.out.println("-----");
+    }
   }
 }
