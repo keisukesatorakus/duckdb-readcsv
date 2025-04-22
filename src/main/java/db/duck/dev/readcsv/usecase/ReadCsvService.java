@@ -1,5 +1,6 @@
 package db.duck.dev.readcsv.usecase;
 
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -44,7 +45,7 @@ public class ReadCsvService {
         Map.of(
             ImportField.CUST_CD, new ImportMethod.FromCsvColumn(4),
             ImportField.AMOUNT, new ImportMethod.FromCsvColumn(6),
-            ImportField.DATE, new ImportMethod.FromCsvColumn(5)
+            ImportField.DATE, new ImportMethod.FromCsvColumn(1)
         )
     );
 
@@ -55,8 +56,26 @@ public class ReadCsvService {
     var pragmaResult = dsl.fetch(String.format("DESCRIBE SELECT * FROM read_csv_auto('%s')", s3Url));
     List<String> columnNames = pragmaResult.getValues("column_name", String.class);
 
+    // columnNames を index をキーに map に変換
+    var columnNameMap = IntStream.range(0, columnNames.size())
+        .boxed()
+        .collect(Collectors.toMap(
+            i -> i,
+            columnNames::get
+        ));
+
+    var selectFields = format.getMappings().entrySet().stream()
+        .filter(e -> e.getValue() instanceof ImportMethod.FromCsvColumn)
+        .map(e -> {
+          var field = e.getKey();
+          var index = ((ImportMethod.FromCsvColumn) e.getValue()).columnIndex();
+          var columnName = columnNameMap.get(index);
+          return String.format("%s as %s", columnName, field);
+        })
+        .collect(Collectors.joining(","));
+
     // <order, カラム> formatで設定されているカラムを取得
-    var selectedColumns = format.getMappings().entrySet().stream()
+    var overrideColumns = format.getMappings().entrySet().stream()
         .filter(entry -> entry.getValue() instanceof ImportMethod.FromCsvColumn)
         .collect(Collectors.toMap(
             entry -> ((ImportMethod.FromCsvColumn) entry.getValue()).columnIndex(),
@@ -68,7 +87,7 @@ public class ReadCsvService {
         .boxed()
         .collect(Collectors.toMap(
             columnNames::get,
-            i -> Optional.ofNullable(selectedColumns.get(i)).map(ImportField::getType).orElse(ImportFieldType.VARCHAR),
+            i -> Optional.ofNullable(overrideColumns.get(i)).map(ImportField::getType).orElse(ImportFieldType.VARCHAR),
             (v1, v2) -> v1,
             LinkedHashMap::new
         ));
@@ -96,7 +115,7 @@ public class ReadCsvService {
         String.format(
             """
                   SELECT
-                    *
+                    %s
                   FROM
                   read_csv_auto(
                     '%s',
@@ -107,31 +126,58 @@ public class ReadCsvService {
                     rejects_limit = 1000
                   )
                 """,
+            selectFields,
             s3Url,
             columnsScan
         )
     );
 
-    // エラー情報の取得
+//    // s3 join
+//    var query = dsl.fetch(
+//        String.format(
+//            """
+//                SELECT t1.*
+//                FROM read_csv_auto(
+//                  '%s',
+//                  columns = {{ %s }},
+//                  store_rejects = true,
+//                  rejects_scan = 'reject_scans',
+//                  rejects_table = 'reject_errors',
+//                  rejects_limit = 1000
+//                ) t1
+//                JOIN read_csv_auto('%s') t2
+//                ON t1.%s = t2.%s
+//                """,
+//            s3Url,
+//            columnsScan,
+//            s3Url,
+//            columnNames.get(4),
+//            columnNames.get(4)
+//        )
+//    );
+
+    // store_rejects
     var rejectErrors = dsl.select()
         .from("reject_errors")
         .fetch();
     printResult(rejectErrors);
+
     var rejectScans = dsl.select()
         .from("reject_scans")
         .fetch();
     printResult(rejectScans);
 
     return new Data(
-        columnNames.stream().map(f -> new Header(f, f)).toList(),
-        res.stream().map(record -> {
-          String[] row = new String[columnNames.size()];
-          for (int i = 0; i < columnNames.size(); i++) {
-            var value = record.get(columnNames.get(i));
-            row[i] = value != null ? value.toString() : null;
-          }
-          return row;
-        }).toList()
+        // header
+        format.getMappings().keySet().stream().map(
+            importMethod -> new Header(importMethod.name(), importMethod.getType().name())).toList(),
+        // rows
+        res.stream()
+            .map(record -> Arrays.stream(record.intoArray())
+                .map(val -> val != null ? val.toString() : "")
+                .toArray(String[]::new)
+            )
+            .toList()
     );
   }
 

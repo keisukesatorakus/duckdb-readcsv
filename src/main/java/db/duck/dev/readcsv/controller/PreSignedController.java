@@ -25,7 +25,7 @@ public class PreSignedController {
 
   private static final long MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 
-  // http://localhost:8080/s3/presigned?filename=sample&prefix=dev
+  // http://localhost:8080/s3/presigned?filename=reports&prefix=dev
   @GetMapping("/presigned")
   public String getPreSignedUrl(@RequestParam String filename, @RequestParam String prefix) {
     String bucket = "duck-db-dev";
