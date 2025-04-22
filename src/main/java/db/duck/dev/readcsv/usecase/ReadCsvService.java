@@ -30,6 +30,7 @@ public class ReadCsvService {
   private final DataSource dataSource;
 
   public record Data(
+      long size,
       List<Header> headers,
       List<String[]> rows
   ) {
@@ -104,12 +105,16 @@ public class ReadCsvService {
                     count(*)
                   FROM
                   read_csv_auto(
-                    '%s'
+                    '%s',
+                    skip = %d,
+                    header = %s
                   )
                 """,
-            s3Url
+            s3Url,
+            skip,
+            header
         )
-    );
+    ).getFirst().get(0, Long.class);
 
     var res = dsl.fetch(
         String.format(
@@ -123,12 +128,16 @@ public class ReadCsvService {
                     store_rejects = true,
                     rejects_scan = 'reject_scans',
                     rejects_table = 'reject_errors',
-                    rejects_limit = 1000
+                    rejects_limit = 1000,
+                    skip = %d,
+                    header = %s
                   )
                 """,
             selectFields,
             s3Url,
-            columnsScan
+            columnsScan,
+            skip,
+            header
         )
     );
 
@@ -168,6 +177,7 @@ public class ReadCsvService {
     printResult(rejectScans);
 
     return new Data(
+        count,
         // header
         format.getMappings().keySet().stream().map(
             importMethod -> new Header(importMethod.name(), importMethod.getType().name())).toList(),
